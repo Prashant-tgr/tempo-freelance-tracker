@@ -1,34 +1,723 @@
-import dotenv from 'dotenv'; dotenv.config(); import express,{Request,Response,NextFunction} from 'express'; import cors from 'cors'; import bcrypt from 'bcryptjs'; import jwt from 'jsonwebtoken'; import {PrismaClient,Prisma} from '@prisma/client'; import {z,ZodError} from 'zod';
-const db=new PrismaClient(); const app=express(); app.use(cors({origin:process.env.CLIENT_ORIGIN||'http://localhost:5173'})); app.use(express.json());
-if(process.env.NODE_ENV==='production'&&!process.env.JWT_SECRET)throw new Error('JWT_SECRET must be set in production'); const secret=process.env.JWT_SECRET||'development-secret-change-this-please';
-type Authed=Request & {userId?:string};
-const auth=(req:Authed,res:Response,next:NextFunction)=>{try{const h=req.headers.authorization;if(!h?.startsWith('Bearer '))return res.status(401).json({error:{message:'Sign in required'}});req.userId=(jwt.verify(h.slice(7),secret) as {sub:string}).sub;next()}catch{return res.status(401).json({error:{message:'Invalid or expired session'}})}};
-const asyncRoute=(fn:(req:Authed,res:Response)=>Promise<unknown>)=>(req:Request,res:Response,next:NextFunction)=>Promise.resolve(fn(req as Authed,res)).catch(next);
-const ok=(data:unknown)=>({data}); const schema=(s:z.ZodTypeAny,b:unknown)=>s.parse(b); const id=z.string().min(1); const entrySchema=z.object({projectId:id,description:z.string().max(500).optional(),startTime:z.string().datetime(),endTime:z.string().datetime(),billable:z.boolean().default(true)});
-app.get('/api/health',(_q,r)=>r.json(ok({status:'ok'})));
-app.post('/api/auth/register',asyncRoute(async(q,r)=>{const x=schema(z.object({email:z.string().email(),password:z.string().min(10)}),q.body) as {email:string,password:string};const passwordHash=await bcrypt.hash(x.password,12);const user=await db.user.create({data:{email:x.email.toLowerCase(),passwordHash}});r.status(201).json(ok({token:jwt.sign({},secret,{subject:user.id,expiresIn:'7d'}),user:{id:user.id,email:user.email}}))}));
-app.post('/api/auth/login',asyncRoute(async(q,r)=>{const x=schema(z.object({email:z.string().email(),password:z.string().min(1)}),q.body) as {email:string,password:string};const u=await db.user.findUnique({where:{email:x.email.toLowerCase()}});if(!u||!await bcrypt.compare(x.password,u.passwordHash))return r.status(401).json({error:{message:'Email or password is incorrect'}});r.json(ok({token:jwt.sign({},secret,{subject:u.id,expiresIn:'7d'}),user:{id:u.id,email:u.email}}))}));
-app.get('/api/auth/me',auth,asyncRoute(async(q,r)=>r.json(ok(await db.user.findUnique({where:{id:q.userId},select:{id:true,email:true}})))));
-app.use('/api',auth);
-app.get('/api/clients',asyncRoute(async(q,r)=>r.json(ok(await db.client.findMany({where:{userId:q.userId},include:{_count:{select:{projects:true}}},orderBy:{name:'asc'}})))));
-app.post('/api/clients',asyncRoute(async(q,r)=>{const x=schema(z.object({name:z.string().min(1).max(120),email:z.string().email().optional().or(z.literal('')),companyName:z.string().max(120).optional(),notes:z.string().max(2000).optional()}),q.body);r.status(201).json(ok(await db.client.create({data:{...x,userId:q.userId!}})))}));
-app.patch('/api/clients/:id',asyncRoute(async(q,r)=>{const x=schema(z.object({name:z.string().min(1).max(120).optional(),email:z.string().email().optional().or(z.literal('')),companyName:z.string().max(120).optional(),notes:z.string().max(2000).optional()}),q.body);const found=await db.client.findFirst({where:{id:String(q.params.id),userId:q.userId}});if(!found)return r.status(404).json({error:{message:'Client not found'}});r.json(ok(await db.client.update({where:{id:found.id},data:x})))}));
-app.delete('/api/clients/:id',asyncRoute(async(q,r)=>{const found=await db.client.findFirst({where:{id:String(q.params.id),userId:q.userId},include:{_count:{select:{projects:true,invoices:true}}}});if(!found)return r.status(404).json({error:{message:'Client not found'}});if(found._count.projects||found._count.invoices)return r.status(409).json({error:{message:'Client has projects or invoices and cannot be deleted'}});await db.client.delete({where:{id:found.id}});r.json(ok({deleted:true}))}));
-app.get('/api/projects',asyncRoute(async(q,r)=>r.json(ok(await db.project.findMany({where:{userId:q.userId},include:{client:true},orderBy:{createdAt:'desc'}})))));
-app.post('/api/projects',asyncRoute(async(q,r)=>{const x=schema(z.object({clientId:id,name:z.string().min(1).max(120),description:z.string().max(2000).optional(),hourlyRate:z.number().nonnegative().max(1000000),currency:z.enum(['USD','EUR','GBP','INR','CAD','AUD','NZD','JPY','CHF']).default('USD')}),q.body) as any;const c=await db.client.findFirst({where:{id:x.clientId,userId:q.userId}});if(!c)return r.status(400).json({error:{message:'Choose a client in your account'}});r.status(201).json(ok(await db.project.create({data:{...x,hourlyRate:new Prisma.Decimal(x.hourlyRate),userId:q.userId!}})))}));
-app.patch('/api/projects/:id',asyncRoute(async(q,r)=>{const x=schema(z.object({name:z.string().min(1).max(120).optional(),description:z.string().max(2000).optional(),hourlyRate:z.number().nonnegative().max(1000000).optional(),currency:z.enum(['USD','EUR','GBP','INR','CAD','AUD','NZD','JPY','CHF']).optional()}),q.body) as any;const p=await db.project.findFirst({where:{id:String(q.params.id),userId:q.userId}});if(!p)return r.status(404).json({error:{message:'Project not found'}});if(x.hourlyRate!==undefined)x.hourlyRate=new Prisma.Decimal(x.hourlyRate);r.json(ok(await db.project.update({where:{id:p.id},data:x})))}));
-app.delete('/api/projects/:id',asyncRoute(async(q,r)=>{const p=await db.project.findFirst({where:{id:String(q.params.id),userId:q.userId},include:{_count:{select:{entries:true,timers:true}}}});if(!p)return r.status(404).json({error:{message:'Project not found'}});if(p._count.entries||p._count.timers)return r.status(409).json({error:{message:'Project has time entries or an active timer and cannot be deleted'}});await db.project.delete({where:{id:p.id}});r.json(ok({deleted:true}))}));
-app.get('/api/timer',asyncRoute(async(q,r)=>{const t=await db.activeTimer.findUnique({where:{userId:q.userId},include:{project:{include:{client:true}}}});r.json(ok(t))}));
-app.post('/api/timer/start',asyncRoute(async(q,r)=>{const x=schema(z.object({projectId:id,description:z.string().max(500).optional()}),q.body);const p=await db.project.findFirst({where:{id:x.projectId,userId:q.userId}});if(!p)return r.status(400).json({error:{message:'Choose a project in your account'}});try{const t=await db.activeTimer.create({data:{userId:q.userId!,projectId:p.id,description:x.description}});r.status(201).json(ok(t))}catch(e){if((e as any).code==='P2002')return r.status(409).json({error:{message:'A timer is already running'}});throw e}}));
-app.post('/api/timer/stop',asyncRoute(async(q,r)=>{const t=await db.activeTimer.findUnique({where:{userId:q.userId},include:{project:true}});if(!t)return r.status(409).json({error:{message:'No timer is running'}});const end=new Date();const durationSeconds=Math.max(1,Math.floor((end.getTime()-t.startedAt.getTime())/1000));try{const entry=await db.$transaction(async(tx)=>{const claimed=await tx.activeTimer.deleteMany({where:{id:t.id,userId:q.userId}});if(!claimed.count)throw new Error('TIMER_ALREADY_STOPPED');return tx.timeEntry.create({data:{userId:q.userId!,projectId:t.projectId,description:t.description,startTime:t.startedAt,endTime:end,durationSeconds,hourlyRateSnapshot:t.project.hourlyRate}})});r.json(ok(entry))}catch(e){if((e as Error).message==='TIMER_ALREADY_STOPPED')return r.status(409).json({error:{message:'Timer has already been stopped'}});throw e}}));
-app.get('/api/entries',asyncRoute(async(q,r)=>{const from=q.query.from?new Date(String(q.query.from)):undefined;const to=q.query.to?new Date(String(q.query.to)):undefined;r.json(ok(await db.timeEntry.findMany({where:{userId:q.userId,...(from||to?{startTime:{...(from?{gte:from}:{}),...(to?{lt:to}:{})}}:{})},include:{project:{include:{client:true}},invoiceLine:true},orderBy:{startTime:'desc'}})))}));
-app.post('/api/entries',asyncRoute(async(q,r)=>{const x=schema(entrySchema,q.body) as any;const startTime=new Date(x.startTime),endTime=new Date(x.endTime),durationSeconds=Math.floor((endTime.getTime()-startTime.getTime())/1000);if(durationSeconds<=0||durationSeconds>86400)return r.status(400).json({error:{message:'Entry duration must be between 1 second and 24 hours'}});const p=await db.project.findFirst({where:{id:x.projectId,userId:q.userId}});if(!p)return r.status(400).json({error:{message:'Choose a project in your account'}});r.status(201).json(ok(await db.timeEntry.create({data:{...x,startTime,endTime,durationSeconds,userId:q.userId!,hourlyRateSnapshot:p.hourlyRate}})))}));
-app.patch('/api/entries/:id',asyncRoute(async(q,r)=>{const x=schema(entrySchema.partial(),q.body) as any;const old=await db.timeEntry.findFirst({where:{id:String(q.params.id),userId:q.userId},include:{invoiceLine:true}});if(!old)return r.status(404).json({error:{message:'Entry not found'}});if(old.invoiceLine)return r.status(409).json({error:{message:'Invoiced entries cannot be changed'}});const projectId=x.projectId||old.projectId;const p=await db.project.findFirst({where:{id:projectId,userId:q.userId}});if(!p)return r.status(400).json({error:{message:'Choose a project in your account'}});const startTime=x.startTime?new Date(x.startTime):old.startTime,endTime=x.endTime?new Date(x.endTime):old.endTime,durationSeconds=Math.floor((endTime.getTime()-startTime.getTime())/1000);if(durationSeconds<=0||durationSeconds>86400)return r.status(400).json({error:{message:'Entry duration must be between 1 second and 24 hours'}});r.json(ok(await db.timeEntry.update({where:{id:old.id},data:{...x,projectId,startTime,endTime,durationSeconds,hourlyRateSnapshot:p.hourlyRate}})))}));
-app.delete('/api/entries/:id',asyncRoute(async(q,r)=>{const e=await db.timeEntry.findFirst({where:{id:String(q.params.id),userId:q.userId},include:{invoiceLine:true}});if(!e)return r.status(404).json({error:{message:'Entry not found'}});if(e.invoiceLine)return r.status(409).json({error:{message:'Invoiced entries cannot be deleted'}});await db.timeEntry.delete({where:{id:e.id}});r.json(ok({deleted:true}))}));
-app.get('/api/timesheet',asyncRoute(async(q,r)=>{const date=String(q.query.weekStart||new Date().toISOString().slice(0,10));if(!/^\d{4}-\d{2}-\d{2}$/.test(date))return r.status(400).json({error:{message:'weekStart must be YYYY-MM-DD'}});const start=new Date(`${date}T00:00:00.000Z`);start.setUTCDate(start.getUTCDate()-((start.getUTCDay()+6)%7));const end=new Date(start);end.setUTCDate(end.getUTCDate()+7);const entries=await db.timeEntry.findMany({where:{userId:q.userId,startTime:{gte:start,lt:end}},include:{project:true}});const days=Array.from({length:7},(_,i)=>{const d=new Date(start);d.setUTCDate(d.getUTCDate()+i);return d.toISOString().slice(0,10)});r.json(ok({weekStart:days[0],days,entries,totals:{seconds:entries.reduce((s,e)=>s+e.durationSeconds,0),billableSeconds:entries.filter(e=>e.billable).reduce((s,e)=>s+e.durationSeconds,0)}}))}));
-app.get('/api/invoices/preview',asyncRoute(async(q,r)=>{const c=String(q.query.clientId||''),from=new Date(String(q.query.from)),to=new Date(String(q.query.to));if(!c||!Number.isFinite(+from)||!Number.isFinite(+to)||from>to)return r.status(400).json({error:{message:'Select a client and valid date range'}});const entries=await db.timeEntry.findMany({where:{userId:q.userId,project:{clientId:c},billable:true,startTime:{gte:from,lt:new Date(+to+86400000)},invoiceLine:{is:null}},include:{project:true},orderBy:{startTime:'asc'}});r.json(ok({entries,total:entries.reduce((s,e)=>s+Number(e.hourlyRateSnapshot)*e.durationSeconds/3600,0)}))}));
-app.get('/api/invoices',asyncRoute(async(q,r)=>r.json(ok(await db.invoice.findMany({where:{userId:q.userId},include:{client:true,_count:{select:{lines:true}}},orderBy:{issueDate:'desc'}})))));
-app.post('/api/invoices',asyncRoute(async(q,r)=>{const x=schema(z.object({clientId:id,from:z.string().regex(/^\d{4}-\d{2}-\d{2}$/),to:z.string().regex(/^\d{4}-\d{2}-\d{2}$/)}),q.body) as any;const from=new Date(`${x.from}T00:00:00.000Z`),to=new Date(`${x.to}T00:00:00.000Z`);if(from>to)return r.status(400).json({error:{message:'Start date must be before end date'}});const client=await db.client.findFirst({where:{id:x.clientId,userId:q.userId}});if(!client)return r.status(404).json({error:{message:'Client not found'}});try{const invoice=await db.$transaction(async(tx)=>{const entries=await tx.timeEntry.findMany({where:{userId:q.userId,project:{clientId:client.id},billable:true,startTime:{gte:from,lt:new Date(+to+86400000)},invoiceLine:{is:null}},include:{project:true},orderBy:{startTime:'asc'}});if(!entries.length)throw new Error('NO_ELIGIBLE');const currency=entries[0].project.currency;if(entries.some(e=>e.project.currency!==currency))throw new Error('CURRENCY_MISMATCH');const number=`INV-${new Date().toISOString().slice(0,10).replaceAll('-','')}-${Math.random().toString(36).slice(2,7).toUpperCase()}`;const total=entries.reduce((s,e)=>s+Math.round(Number(e.hourlyRateSnapshot)*e.durationSeconds/3600*100)/100,0);return tx.invoice.create({data:{userId:q.userId!,clientId:client.id,invoiceNumber:number,periodStart:from,periodEnd:to,currency,subtotal:total,total,lines:{create:entries.map(e=>({timeEntryId:e.id,description:e.description||e.project.name,dateWorked:e.startTime,hours:new Prisma.Decimal(e.durationSeconds/3600),hourlyRate:e.hourlyRateSnapshot,amount:new Prisma.Decimal(Math.round(Number(e.hourlyRateSnapshot)*e.durationSeconds/3600*100)/100)}))}},include:{client:true,lines:{include:{timeEntry:true}}}})},{isolationLevel:Prisma.TransactionIsolationLevel.Serializable});r.status(201).json(ok(invoice))}catch(e){if((e as Error).message==='NO_ELIGIBLE')return r.status(409).json({error:{message:'No uninvoiced billable entries in that period'}});if((e as any).code==='P2002'||(e as any).code==='P2034')return r.status(409).json({error:{message:'One or more entries were invoiced concurrently; refresh the preview'}});if((e as Error).message==='CURRENCY_MISMATCH')return r.status(409).json({error:{message:'An invoice cannot combine project currencies'}});throw e}}));
-app.get('/api/invoices/:id',asyncRoute(async(q,r)=>{const invoice=await db.invoice.findFirst({where:{id:String(q.params.id),userId:q.userId},include:{client:true,lines:{include:{timeEntry:{include:{project:true}}}}}});if(!invoice)return r.status(404).json({error:{message:'Invoice not found'}});r.json(ok(invoice))}));
-app.use((e:unknown,_q:Request,r:Response,_n:NextFunction)=>{if(e instanceof ZodError)return r.status(400).json({error:{message:e.issues.map(i=>`${i.path.join('.')}: ${i.message}`).join('; ')}});if((e as any)?.code==='P2002')return r.status(409).json({error:{message:'A record with this value already exists'}});console.error(e);r.status(500).json({error:{message:'Unexpected server error'}})});
-if(process.env.NODE_ENV!=='test')app.listen(Number(process.env.PORT)||4000,()=>console.log(`API listening on ${Number(process.env.PORT)||4000}`)); export {app,db};
+import dotenv from "dotenv";
+dotenv.config();
+import express, { Request, Response, NextFunction } from "express";
+import cors from "cors";
+import bcrypt from "bcryptjs";
+import jwt from "jsonwebtoken";
+import { PrismaClient, Prisma } from "@prisma/client";
+import { z, ZodError } from "zod";
+const db = new PrismaClient();
+const app = express();
+app.use(cors({ origin: process.env.CLIENT_ORIGIN || "http://localhost:5173" }));
+app.use(express.json());
+if (process.env.NODE_ENV === "production" && !process.env.JWT_SECRET)
+  throw new Error("JWT_SECRET must be set in production");
+const secret =
+  process.env.JWT_SECRET || "development-secret-change-this-please";
+type Authed = Request & { userId?: string };
+const auth = (req: Authed, res: Response, next: NextFunction) => {
+  try {
+    const h = req.headers.authorization;
+    if (!h?.startsWith("Bearer "))
+      return res.status(401).json({ error: { message: "Sign in required" } });
+    req.userId = (jwt.verify(h.slice(7), secret) as { sub: string }).sub;
+    next();
+  } catch {
+    return res
+      .status(401)
+      .json({ error: { message: "Invalid or expired session" } });
+  }
+};
+const asyncRoute =
+  (fn: (req: Authed, res: Response) => Promise<unknown>) =>
+  (req: Request, res: Response, next: NextFunction) =>
+    Promise.resolve(fn(req as Authed, res)).catch(next);
+const ok = (data: unknown) => ({ data });
+const schema = (s: z.ZodTypeAny, b: unknown) => s.parse(b);
+const id = z.string().min(1);
+const entrySchema = z.object({
+  projectId: id,
+  description: z.string().max(500).optional(),
+  startTime: z.string().datetime(),
+  endTime: z.string().datetime(),
+  billable: z.boolean().default(true),
+});
+app.get("/api/health", (_q, r) => r.json(ok({ status: "ok" })));
+app.post(
+  "/api/auth/register",
+  asyncRoute(async (q, r) => {
+    const x = schema(
+      z.object({ email: z.string().email(), password: z.string().min(10) }),
+      q.body,
+    ) as { email: string; password: string };
+    const passwordHash = await bcrypt.hash(x.password, 12);
+    const user = await db.user.create({
+      data: { email: x.email.toLowerCase(), passwordHash },
+    });
+    r.status(201).json(
+      ok({
+        token: jwt.sign({}, secret, { subject: user.id, expiresIn: "7d" }),
+        user: { id: user.id, email: user.email },
+      }),
+    );
+  }),
+);
+app.post(
+  "/api/auth/login",
+  asyncRoute(async (q, r) => {
+    const x = schema(
+      z.object({ email: z.string().email(), password: z.string().min(1) }),
+      q.body,
+    ) as { email: string; password: string };
+    const u = await db.user.findUnique({
+      where: { email: x.email.toLowerCase() },
+    });
+    if (!u || !(await bcrypt.compare(x.password, u.passwordHash)))
+      return r
+        .status(401)
+        .json({ error: { message: "Email or password is incorrect" } });
+    r.json(
+      ok({
+        token: jwt.sign({}, secret, { subject: u.id, expiresIn: "7d" }),
+        user: { id: u.id, email: u.email },
+      }),
+    );
+  }),
+);
+app.get(
+  "/api/auth/me",
+  auth,
+  asyncRoute(async (q, r) =>
+    r.json(
+      ok(
+        await db.user.findUnique({
+          where: { id: q.userId },
+          select: { id: true, email: true },
+        }),
+      ),
+    ),
+  ),
+);
+app.use("/api", auth);
+app.get(
+  "/api/clients",
+  asyncRoute(async (q, r) =>
+    r.json(
+      ok(
+        await db.client.findMany({
+          where: { userId: q.userId },
+          include: { _count: { select: { projects: true } } },
+          orderBy: { name: "asc" },
+        }),
+      ),
+    ),
+  ),
+);
+app.post(
+  "/api/clients",
+  asyncRoute(async (q, r) => {
+    const x = schema(
+      z.object({
+        name: z.string().min(1).max(120),
+        email: z.string().email().optional().or(z.literal("")),
+        companyName: z.string().max(120).optional(),
+        notes: z.string().max(2000).optional(),
+      }),
+      q.body,
+    );
+    r.status(201).json(
+      ok(await db.client.create({ data: { ...x, userId: q.userId! } })),
+    );
+  }),
+);
+app.patch(
+  "/api/clients/:id",
+  asyncRoute(async (q, r) => {
+    const x = schema(
+      z.object({
+        name: z.string().min(1).max(120).optional(),
+        email: z.string().email().optional().or(z.literal("")),
+        companyName: z.string().max(120).optional(),
+        notes: z.string().max(2000).optional(),
+      }),
+      q.body,
+    );
+    const found = await db.client.findFirst({
+      where: { id: String(q.params.id), userId: q.userId },
+    });
+    if (!found)
+      return r.status(404).json({ error: { message: "Client not found" } });
+    r.json(ok(await db.client.update({ where: { id: found.id }, data: x })));
+  }),
+);
+app.delete(
+  "/api/clients/:id",
+  asyncRoute(async (q, r) => {
+    const found = await db.client.findFirst({
+      where: { id: String(q.params.id), userId: q.userId },
+      include: { _count: { select: { projects: true, invoices: true } } },
+    });
+    if (!found)
+      return r.status(404).json({ error: { message: "Client not found" } });
+    if (found._count.projects || found._count.invoices)
+      return r
+        .status(409)
+        .json({
+          error: {
+            message: "Client has projects or invoices and cannot be deleted",
+          },
+        });
+    await db.client.delete({ where: { id: found.id } });
+    r.json(ok({ deleted: true }));
+  }),
+);
+app.get(
+  "/api/projects",
+  asyncRoute(async (q, r) =>
+    r.json(
+      ok(
+        await db.project.findMany({
+          where: { userId: q.userId },
+          include: { client: true },
+          orderBy: { createdAt: "desc" },
+        }),
+      ),
+    ),
+  ),
+);
+app.post(
+  "/api/projects",
+  asyncRoute(async (q, r) => {
+    const x = schema(
+      z.object({
+        clientId: id,
+        name: z.string().min(1).max(120),
+        description: z.string().max(2000).optional(),
+        hourlyRate: z.number().nonnegative().max(1000000),
+        currency: z
+          .enum(["USD", "EUR", "GBP", "INR", "CAD", "AUD", "NZD", "JPY", "CHF"])
+          .default("USD"),
+      }),
+      q.body,
+    ) as any;
+    const c = await db.client.findFirst({
+      where: { id: x.clientId, userId: q.userId },
+    });
+    if (!c)
+      return r
+        .status(400)
+        .json({ error: { message: "Choose a client in your account" } });
+    r.status(201).json(
+      ok(
+        await db.project.create({
+          data: {
+            ...x,
+            hourlyRate: new Prisma.Decimal(x.hourlyRate),
+            userId: q.userId!,
+          },
+        }),
+      ),
+    );
+  }),
+);
+app.patch(
+  "/api/projects/:id",
+  asyncRoute(async (q, r) => {
+    const x = schema(
+      z.object({
+        name: z.string().min(1).max(120).optional(),
+        description: z.string().max(2000).optional(),
+        hourlyRate: z.number().nonnegative().max(1000000).optional(),
+        currency: z
+          .enum(["USD", "EUR", "GBP", "INR", "CAD", "AUD", "NZD", "JPY", "CHF"])
+          .optional(),
+      }),
+      q.body,
+    ) as any;
+    const p = await db.project.findFirst({
+      where: { id: String(q.params.id), userId: q.userId },
+    });
+    if (!p)
+      return r.status(404).json({ error: { message: "Project not found" } });
+    if (x.hourlyRate !== undefined)
+      x.hourlyRate = new Prisma.Decimal(x.hourlyRate);
+    r.json(ok(await db.project.update({ where: { id: p.id }, data: x })));
+  }),
+);
+app.delete(
+  "/api/projects/:id",
+  asyncRoute(async (q, r) => {
+    const p = await db.project.findFirst({
+      where: { id: String(q.params.id), userId: q.userId },
+      include: { _count: { select: { entries: true, timers: true } } },
+    });
+    if (!p)
+      return r.status(404).json({ error: { message: "Project not found" } });
+    if (p._count.entries || p._count.timers)
+      return r
+        .status(409)
+        .json({
+          error: {
+            message:
+              "Project has time entries or an active timer and cannot be deleted",
+          },
+        });
+    await db.project.delete({ where: { id: p.id } });
+    r.json(ok({ deleted: true }));
+  }),
+);
+app.get(
+  "/api/timer",
+  asyncRoute(async (q, r) => {
+    const t = await db.activeTimer.findUnique({
+      where: { userId: q.userId },
+      include: { project: { include: { client: true } } },
+    });
+    r.json(ok(t));
+  }),
+);
+app.post(
+  "/api/timer/start",
+  asyncRoute(async (q, r) => {
+    const x = schema(
+      z.object({ projectId: id, description: z.string().max(500).optional() }),
+      q.body,
+    );
+    const p = await db.project.findFirst({
+      where: { id: x.projectId, userId: q.userId },
+    });
+    if (!p)
+      return r
+        .status(400)
+        .json({ error: { message: "Choose a project in your account" } });
+    try {
+      const t = await db.activeTimer.create({
+        data: {
+          userId: q.userId!,
+          projectId: p.id,
+          description: x.description,
+        },
+      });
+      r.status(201).json(ok(t));
+    } catch (e) {
+      if ((e as any).code === "P2002")
+        return r
+          .status(409)
+          .json({ error: { message: "A timer is already running" } });
+      throw e;
+    }
+  }),
+);
+app.post(
+  "/api/timer/stop",
+  asyncRoute(async (q, r) => {
+    const t = await db.activeTimer.findUnique({
+      where: { userId: q.userId },
+      include: { project: true },
+    });
+    if (!t)
+      return r.status(409).json({ error: { message: "No timer is running" } });
+    const end = new Date();
+    const durationSeconds = Math.max(
+      1,
+      Math.floor((end.getTime() - t.startedAt.getTime()) / 1000),
+    );
+    try {
+      const entry = await db.$transaction(async (tx) => {
+        const claimed = await tx.activeTimer.deleteMany({
+          where: { id: t.id, userId: q.userId },
+        });
+        if (!claimed.count) throw new Error("TIMER_ALREADY_STOPPED");
+        return tx.timeEntry.create({
+          data: {
+            userId: q.userId!,
+            projectId: t.projectId,
+            description: t.description,
+            startTime: t.startedAt,
+            endTime: end,
+            durationSeconds,
+            hourlyRateSnapshot: t.project.hourlyRate,
+          },
+        });
+      });
+      r.json(ok(entry));
+    } catch (e) {
+      if ((e as Error).message === "TIMER_ALREADY_STOPPED")
+        return r
+          .status(409)
+          .json({ error: { message: "Timer has already been stopped" } });
+      throw e;
+    }
+  }),
+);
+app.get(
+  "/api/entries",
+  asyncRoute(async (q, r) => {
+    const from = q.query.from ? new Date(String(q.query.from)) : undefined;
+    const to = q.query.to ? new Date(String(q.query.to)) : undefined;
+    r.json(
+      ok(
+        await db.timeEntry.findMany({
+          where: {
+            userId: q.userId,
+            ...(from || to
+              ? {
+                  startTime: {
+                    ...(from ? { gte: from } : {}),
+                    ...(to ? { lt: to } : {}),
+                  },
+                }
+              : {}),
+          },
+          include: {
+            project: { include: { client: true } },
+            invoiceLine: true,
+          },
+          orderBy: { startTime: "desc" },
+        }),
+      ),
+    );
+  }),
+);
+app.post(
+  "/api/entries",
+  asyncRoute(async (q, r) => {
+    const x = schema(entrySchema, q.body) as any;
+    const startTime = new Date(x.startTime),
+      endTime = new Date(x.endTime),
+      durationSeconds = Math.floor(
+        (endTime.getTime() - startTime.getTime()) / 1000,
+      );
+    if (durationSeconds <= 0 || durationSeconds > 86400)
+      return r
+        .status(400)
+        .json({
+          error: {
+            message: "Entry duration must be between 1 second and 24 hours",
+          },
+        });
+    const p = await db.project.findFirst({
+      where: { id: x.projectId, userId: q.userId },
+    });
+    if (!p)
+      return r
+        .status(400)
+        .json({ error: { message: "Choose a project in your account" } });
+    r.status(201).json(
+      ok(
+        await db.timeEntry.create({
+          data: {
+            ...x,
+            startTime,
+            endTime,
+            durationSeconds,
+            userId: q.userId!,
+            hourlyRateSnapshot: p.hourlyRate,
+          },
+        }),
+      ),
+    );
+  }),
+);
+app.patch(
+  "/api/entries/:id",
+  asyncRoute(async (q, r) => {
+    const x = schema(entrySchema.partial(), q.body) as any;
+    const old = await db.timeEntry.findFirst({
+      where: { id: String(q.params.id), userId: q.userId },
+      include: { invoiceLine: true },
+    });
+    if (!old)
+      return r.status(404).json({ error: { message: "Entry not found" } });
+    if (old.invoiceLine)
+      return r
+        .status(409)
+        .json({ error: { message: "Invoiced entries cannot be changed" } });
+    const projectId = x.projectId || old.projectId;
+    const p = await db.project.findFirst({
+      where: { id: projectId, userId: q.userId },
+    });
+    if (!p)
+      return r
+        .status(400)
+        .json({ error: { message: "Choose a project in your account" } });
+    const startTime = x.startTime ? new Date(x.startTime) : old.startTime,
+      endTime = x.endTime ? new Date(x.endTime) : old.endTime,
+      durationSeconds = Math.floor(
+        (endTime.getTime() - startTime.getTime()) / 1000,
+      );
+    if (durationSeconds <= 0 || durationSeconds > 86400)
+      return r
+        .status(400)
+        .json({
+          error: {
+            message: "Entry duration must be between 1 second and 24 hours",
+          },
+        });
+    r.json(
+      ok(
+        await db.timeEntry.update({
+          where: { id: old.id },
+          data: {
+            ...x,
+            projectId,
+            startTime,
+            endTime,
+            durationSeconds,
+            hourlyRateSnapshot: p.hourlyRate,
+          },
+        }),
+      ),
+    );
+  }),
+);
+app.delete(
+  "/api/entries/:id",
+  asyncRoute(async (q, r) => {
+    const e = await db.timeEntry.findFirst({
+      where: { id: String(q.params.id), userId: q.userId },
+      include: { invoiceLine: true },
+    });
+    if (!e)
+      return r.status(404).json({ error: { message: "Entry not found" } });
+    if (e.invoiceLine)
+      return r
+        .status(409)
+        .json({ error: { message: "Invoiced entries cannot be deleted" } });
+    await db.timeEntry.delete({ where: { id: e.id } });
+    r.json(ok({ deleted: true }));
+  }),
+);
+app.get(
+  "/api/timesheet",
+  asyncRoute(async (q, r) => {
+    const date = String(
+      q.query.weekStart || new Date().toISOString().slice(0, 10),
+    );
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(date))
+      return r
+        .status(400)
+        .json({ error: { message: "weekStart must be YYYY-MM-DD" } });
+    const start = new Date(`${date}T00:00:00.000Z`);
+    start.setUTCDate(start.getUTCDate() - ((start.getUTCDay() + 6) % 7));
+    const end = new Date(start);
+    end.setUTCDate(end.getUTCDate() + 7);
+    const entries = await db.timeEntry.findMany({
+      where: { userId: q.userId, startTime: { gte: start, lt: end } },
+      include: { project: true },
+    });
+    const days = Array.from({ length: 7 }, (_, i) => {
+      const d = new Date(start);
+      d.setUTCDate(d.getUTCDate() + i);
+      return d.toISOString().slice(0, 10);
+    });
+    r.json(
+      ok({
+        weekStart: days[0],
+        days,
+        entries,
+        totals: {
+          seconds: entries.reduce((s, e) => s + e.durationSeconds, 0),
+          billableSeconds: entries
+            .filter((e) => e.billable)
+            .reduce((s, e) => s + e.durationSeconds, 0),
+        },
+      }),
+    );
+  }),
+);
+app.get(
+  "/api/invoices/preview",
+  asyncRoute(async (q, r) => {
+    const c = String(q.query.clientId || ""),
+      from = new Date(String(q.query.from)),
+      to = new Date(String(q.query.to));
+    if (!c || !Number.isFinite(+from) || !Number.isFinite(+to) || from > to)
+      return r
+        .status(400)
+        .json({ error: { message: "Select a client and valid date range" } });
+    const entries = await db.timeEntry.findMany({
+      where: {
+        userId: q.userId,
+        project: { clientId: c },
+        billable: true,
+        startTime: { gte: from, lt: new Date(+to + 86400000) },
+        invoiceLine: { is: null },
+      },
+      include: { project: true },
+      orderBy: { startTime: "asc" },
+    });
+    r.json(
+      ok({
+        entries,
+        total: entries.reduce(
+          (s, e) =>
+            s + (Number(e.hourlyRateSnapshot) * e.durationSeconds) / 3600,
+          0,
+        ),
+      }),
+    );
+  }),
+);
+app.get(
+  "/api/invoices",
+  asyncRoute(async (q, r) =>
+    r.json(
+      ok(
+        await db.invoice.findMany({
+          where: { userId: q.userId },
+          include: { client: true, _count: { select: { lines: true } } },
+          orderBy: { issueDate: "desc" },
+        }),
+      ),
+    ),
+  ),
+);
+app.post(
+  "/api/invoices",
+  asyncRoute(async (q, r) => {
+    const x = schema(
+      z.object({
+        clientId: id,
+        from: z.string().regex(/^\d{4}-\d{2}-\d{2}$/),
+        to: z.string().regex(/^\d{4}-\d{2}-\d{2}$/),
+      }),
+      q.body,
+    ) as any;
+    const from = new Date(`${x.from}T00:00:00.000Z`),
+      to = new Date(`${x.to}T00:00:00.000Z`);
+    if (from > to)
+      return r
+        .status(400)
+        .json({ error: { message: "Start date must be before end date" } });
+    const client = await db.client.findFirst({
+      where: { id: x.clientId, userId: q.userId },
+    });
+    if (!client)
+      return r.status(404).json({ error: { message: "Client not found" } });
+    try {
+      const invoice = await db.$transaction(
+        async (tx) => {
+          const entries = await tx.timeEntry.findMany({
+            where: {
+              userId: q.userId,
+              project: { clientId: client.id },
+              billable: true,
+              startTime: { gte: from, lt: new Date(+to + 86400000) },
+              invoiceLine: { is: null },
+            },
+            include: { project: true },
+            orderBy: { startTime: "asc" },
+          });
+          if (!entries.length) throw new Error("NO_ELIGIBLE");
+          const currency = entries[0].project.currency;
+          if (entries.some((e) => e.project.currency !== currency))
+            throw new Error("CURRENCY_MISMATCH");
+          const number = `INV-${new Date().toISOString().slice(0, 10).replaceAll("-", "")}-${Math.random().toString(36).slice(2, 7).toUpperCase()}`;
+          const total = entries.reduce(
+            (s, e) =>
+              s +
+              Math.round(
+                ((Number(e.hourlyRateSnapshot) * e.durationSeconds) / 3600) *
+                  100,
+              ) /
+                100,
+            0,
+          );
+          return tx.invoice.create({
+            data: {
+              userId: q.userId!,
+              clientId: client.id,
+              invoiceNumber: number,
+              periodStart: from,
+              periodEnd: to,
+              currency,
+              subtotal: total,
+              total,
+              lines: {
+                create: entries.map((e) => ({
+                  timeEntryId: e.id,
+                  description: e.description || e.project.name,
+                  dateWorked: e.startTime,
+                  hours: new Prisma.Decimal(e.durationSeconds / 3600),
+                  hourlyRate: e.hourlyRateSnapshot,
+                  amount: new Prisma.Decimal(
+                    Math.round(
+                      ((Number(e.hourlyRateSnapshot) * e.durationSeconds) /
+                        3600) *
+                        100,
+                    ) / 100,
+                  ),
+                })),
+              },
+            },
+            include: { client: true, lines: { include: { timeEntry: true } } },
+          });
+        },
+        { isolationLevel: Prisma.TransactionIsolationLevel.Serializable },
+      );
+      r.status(201).json(ok(invoice));
+    } catch (e) {
+      if ((e as Error).message === "NO_ELIGIBLE")
+        return r
+          .status(409)
+          .json({
+            error: { message: "No uninvoiced billable entries in that period" },
+          });
+      if ((e as any).code === "P2002" || (e as any).code === "P2034")
+        return r
+          .status(409)
+          .json({
+            error: {
+              message:
+                "One or more entries were invoiced concurrently; refresh the preview",
+            },
+          });
+      if ((e as Error).message === "CURRENCY_MISMATCH")
+        return r
+          .status(409)
+          .json({
+            error: { message: "An invoice cannot combine project currencies" },
+          });
+      throw e;
+    }
+  }),
+);
+app.get(
+  "/api/invoices/:id",
+  asyncRoute(async (q, r) => {
+    const invoice = await db.invoice.findFirst({
+      where: { id: String(q.params.id), userId: q.userId },
+      include: {
+        client: true,
+        lines: { include: { timeEntry: { include: { project: true } } } },
+      },
+    });
+    if (!invoice)
+      return r.status(404).json({ error: { message: "Invoice not found" } });
+    r.json(ok(invoice));
+  }),
+);
+app.use((e: unknown, _q: Request, r: Response, _n: NextFunction) => {
+  if (e instanceof ZodError)
+    return r
+      .status(400)
+      .json({
+        error: {
+          message: e.issues
+            .map((i) => `${i.path.join(".")}: ${i.message}`)
+            .join("; "),
+        },
+      });
+  if ((e as any)?.code === "P2002")
+    return r
+      .status(409)
+      .json({ error: { message: "A record with this value already exists" } });
+  console.error(e);
+  r.status(500).json({ error: { message: "Unexpected server error" } });
+});
+if (process.env.NODE_ENV !== "test")
+  app.listen(Number(process.env.PORT) || 4000, () =>
+    console.log(`API listening on ${Number(process.env.PORT) || 4000}`),
+  );
+export { app, db };
