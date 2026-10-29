@@ -1,0 +1,4 @@
+export function elapsedSeconds(start: Date, end: Date) { return Math.floor((end.getTime() - start.getTime()) / 1000); }
+export function weekBoundsUTC(value: string) { const start = new Date(`${value}T00:00:00.000Z`); start.setUTCDate(start.getUTCDate() - ((start.getUTCDay() + 6) % 7)); const end = new Date(start); end.setUTCDate(end.getUTCDate() + 7); return { start, end }; }
+export function invoiceLineAmount(rate: number, seconds: number) { return Math.round(rate * seconds / 3600 * 100) / 100; }
+export function isInvoiceEligible(entry: { billable: boolean; invoiceLine: unknown; startTime: Date; userId: string; projectUserId: string; projectClientId: string }, userId: string, clientId: string, from: Date, toExclusive: Date) { return entry.userId === userId && entry.projectUserId === userId && entry.projectClientId === clientId && entry.billable && entry.invoiceLine == null && entry.startTime >= from && entry.startTime < toExclusive; }
